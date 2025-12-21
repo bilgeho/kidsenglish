@@ -1,13 +1,112 @@
 import streamlit as st
 from gtts import gTTS
+import sqlite3
 import io
+from openai import OpenAI
+import base64
 
-# --- AI GORSEL PROMPT FONKSIYONU ---
+# -----------------------------
+# OpenAI istemcisi ve görsel üretimi
+# -----------------------------
+def get_openai_client() -> OpenAI | None:
+    api_key = st.secrets.get("OPENAI_API_KEY", "")
+    if not api_key:
+        return None
+    return OpenAI(api_key=api_key)
+
+
+@st.cache_data(show_spinner=True)
+def generate_image_bytes(prompt: str) -> bytes | None:
+    client = get_openai_client()
+    if client is None:
+        st.warning("OPENAI_API_KEY bulunamadı, demo modunda çalışıyor.")
+        return None
+
+    try:
+        result = client.images.generate(
+            model="gpt-image-1",
+            prompt=prompt,
+            size="512x512",
+            n=1,
+        )
+        image_base64 = result.data[0].b64_json
+        return base64.b64decode(image_base64)
+    except Exception as e:
+        st.error(f"Görsel üretim hatası: {e}")
+        return None
+
+
+
+# -----------------------------
+# Yardımcı fonksiyonlar (DB, TTS, prompt)
+# -----------------------------
+def get_db_connection():
+    # content.db proje kökünde duruyor
+    return sqlite3.connect("content.db")
+
+
+def get_sentence(level: str, page: int):
+    """
+    Seviye + sayfa numarasına göre DB'den cümleyi getirir.
+    sentences(level, page, text_en, text_tr)
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, text_en, text_tr
+        FROM sentences
+        WHERE level = ? AND page = ?
+        LIMIT 1
+        """,
+        (level, page),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "text_en": row[1],
+        "text_tr": row[2],
+    }
+
+
+def get_question(sentence_id: int):
+    """
+    Verilen cümle id'sine bağlı soruyu DB'den getirir.
+    questions(sentence_id, question, option_a, option_b, option_c, correct_opt)
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT question, option_a, option_b, option_c, correct_opt
+        FROM questions
+        WHERE sentence_id = ?
+        LIMIT 1
+        """,
+        (sentence_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "text": row[0],
+        "options": [row[1], row[2], row[3]],
+        "correct": row[4],  # "A" / "B" / "C"
+    }
+
+
 def build_image_prompt(child_name: str, level: str, page: int, base_text: str) -> str:
+    """
+    Görsel üretim modeli için prompt.
+    """
     level_desc = {
         "Başlangıç": "very simple, clear shapes, for kids aged 4-6",
         "Orta": "slightly more detailed, for kids aged 7-9",
-        "İleri": "richer scenes with more details, for kids aged 9-11"
+        "İleri": "richer scenes with more details, for kids aged 9-11",
     }.get(level, "children's book style")
 
     page_moods = [
@@ -17,235 +116,147 @@ def build_image_prompt(child_name: str, level: str, page: int, base_text: str) -
         "surprised reaction scene",
         "happy sharing moment",
         "calm resting scene",
-        "exciting adventure moment",
-        "sunset soft light",
-        "cozy close-up scene",
-        "warm story ending scene"
     ]
-    page_mood = page_moods[page]
-
-    learning_hint = f"Show clearly the idea: '{base_text}' so kids can learn this English sentence."
+    mood = page_moods[(page - 1) % len(page_moods)]
 
     prompt = (
-        f"cute children’s book illustration of a child named {child_name}, "
-        f"in the story moment: {base_text}. "
-        f"{learning_hint} "
-        f"Scene style: {page_mood}, {level_desc}, colorful, soft lines, no text, "
-        f"safe for children"
+        f"Illustration for a kids English story. "
+        f"Child name: {child_name}. "
+        f"Story text: '{base_text}'. "
+        f"Style: {level_desc}. "
+        f"Scene mood: {mood}."
     )
     return prompt
 
-# --- PROFIL ve STATE ---
+
+def tts_from_text(text: str, lang: str = "en") -> bytes:
+    """
+    gTTS ile metni sese çevirir, raw bytes döner.
+    """
+    tts = gTTS(text=text, lang=lang)
+    buf = io.BytesIO()
+    tts.write_to_fp(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+# -----------------------------
+# Streamlit uygulaması
+# -----------------------------
+st.set_page_config(page_title="Kids English Story", page_icon="🧒", layout="wide")
+
+st.markdown("<h1 style='text-align: center;'>🧒 Kids English Story</h1>", unsafe_allow_html=True)
+st.write("Çocuğun adı ve seviyesini seç, sonra hikâyeyi başlat.")
+
+
+# Profil oluşturma / demo başlatma
 if "profile" not in st.session_state:
-    st.session_state.profile = {
-        "name": "",
-        "level": "Başlangıç",
-        "page": 0,
-        "progress": 0,
-        "total_pages_read": 0,
-        "total_correct": 0,
-    }
+    with st.form("profile_form"):
+        child_name = st.text_input("Çocuk Adı:", value="Duru")
+        level = st.selectbox("Seviye", ["Başlangıç", "Orta", "İleri"])
+        submitted = st.form_submit_button("Hikayeyi Başlat")
 
-st.title("🧒 Kids English Story")
-st.markdown("Çocuklar için seviyeli, kişiselleştirilmiş ve sesli İngilizce hikayeler")
+    if submitted:
+        st.session_state.profile = {
+            "name": child_name.strip() or "Duru",
+            "level": level,
+        }
+        st.session_state.page = 1
+        st.rerun()
 
-# --- PROFIL GIRISI ---
-name = st.text_input("Çocuk Adı:", value=st.session_state.profile["name"])
-level = st.selectbox(
-    "Seviye",
-    ["Başlangıç", "Orta", "İleri"],
-    index=["Başlangıç", "Orta", "İleri"].index(st.session_state.profile["level"])
-)
+else:
+    profile = st.session_state.profile
+    name = profile["name"]
+    level = profile["level"]
+    page_no = st.session_state.get("page", 1)
 
-if st.button("👋 Profili Kaydet ve Başla"):
-    st.session_state.profile["name"] = name
-    st.session_state.profile["level"] = level
-    st.session_state.profile["page"] = 0
-    st.session_state.profile["progress"] = 0
-    st.session_state.profile["total_pages_read"] = 0
-    st.session_state.profile["total_correct"] = 0
-    st.rerun()
+    # -------------------------
+    # Hikaye cümlesini DB'den çek
+    # -------------------------
+    sentence = get_sentence(level, page_no)
 
-# --- 10 SAYFALIK HIKAYELER ---
-stories = {
-    "Başlangıç": [
-        "This is a cat.",
-        "The cat is happy.",
-        "The cat runs.",
-        "This is a dog.",
-        "The dog is friendly.",
-        "Cat and dog play.",
-        "They play in the park.",
-        "The sun is bright.",
-        "They eat and rest.",
-        "Good night, friends!"
-    ],
-    "Orta": [
-        "The happy cat runs in the park.",
-        "A small dog joins the cat.",
-        "They chase a red ball.",
-        "The ball rolls under a tree.",
-        "The cat jumps to catch it.",
-        "The dog barks and laughs.",
-        "Children watch and smile.",
-        "The sun starts to go down.",
-        "They sit and eat snacks.",
-        "It was a fun day."
-    ],
-    "İleri": [
-        "The clever cat woke up early.",
-        "In the big park, the playful dog waited.",
-        "They planned an exciting adventure together.",
-        "A red ball became their treasure.",
-        "They searched behind trees and under benches.",
-        "The cat climbed high to look around.",
-        "The dog sniffed the ground carefully.",
-        "Finally, they found the ball near a flower bed.",
-        "They shared the toy and felt proud.",
-        "It was the perfect ending to a brave day."
-    ]
-}
+    if sentence is None:
+        st.warning("Bu seviye/sayfa için henüz cümle eklenmedi.")
+        story_text = ""
+    else:
+        story_text = sentence["text_en"]
 
-# --- QUIZ SORULARI ---
-quiz_data = {
-    "Başlangıç": {
-        0: {"question": "What animal is this?",
-            "options": ["Cat", "Dog", "Bird"],
-            "answer": "Cat"},
-        1: {"question": "How is the cat?",
-            "options": ["Sad", "Happy", "Angry"],
-            "answer": "Happy"},
-        2: {"question": "What does the cat do?",
-            "options": ["Runs", "Sleeps", "Flies"],
-            "answer": "Runs"},
-        3: {"question": "What animal is this?",
-            "options": ["Dog", "Fish", "Cat"],
-            "answer": "Dog"},
-        4: {"question": "How is the dog?",
-            "options": ["Friendly", "Scary", "Invisible"],
-            "answer": "Friendly"},
-        5: {"question": "Where do the cat and dog play?",
-            "options": ["In the park", "In the car", "In the sky"],
-            "answer": "In the park"},
-        6: {"question": "What is the weather like?",
-            "options": ["Rainy", "Sunny", "Snowy"],
-            "answer": "Sunny"},
-        7: {"question": "What shines in the sky?",
-            "options": ["The moon", "The sun", "A plane"],
-            "answer": "The sun"},
-        8: {"question": "What do they do after playing?",
-            "options": ["Eat and rest", "Go to school", "Fly away"],
-            "answer": "Eat and rest"},
-        9: {"question": "What time is it in the story?",
-            "options": ["Morning", "Afternoon", "Night"],
-            "answer": "Night"},
-    },
-    "Orta": {
-        0: {"question": "Where does the cat run?",
-            "options": ["In the park", "In the house", "In the car"],
-            "answer": "In the park"},
-        1: {"question": "Who joins the cat?",
-            "options": ["A bird", "A small dog", "A child"],
-            "answer": "A small dog"},
-        2: {"question": "What do they chase?",
-            "options": ["A red ball", "A blue car", "A yellow bird"],
-            "answer": "A red ball"},
-    },
-    "İleri": {
-        0: {"question": "When does the clever cat wake up?",
-            "options": ["Late at night", "Early in the morning", "At midnight"],
-            "answer": "Early in the morning"},
-        1: {"question": "Where does the playful dog wait?",
-            "options": ["In the big park", "In the kitchen", "On the roof"],
-            "answer": "In the big park"},
-        2: {"question": "What becomes their treasure?",
-            "options": ["A red ball", "A blue book", "A green hat"],
-            "answer": "A red ball"},
-    }
-}
+    # Üst bilgi
+    st.markdown(f"### 📖 {name} için hikaye")
+    st.caption(f"Sayfa {page_no} – Seviye: {level}")
 
-# --- HIKAYE GOSTERIMI ---
-if st.session_state.profile["name"]:
-    p = st.session_state.profile
-    current_story = stories[p["level"]]
-    page = p["page"]
+    # Hikaye metni
+    st.markdown(f"**{story_text}**")
 
-    st.markdown(f"### 📖 {p['name']} için hikaye")
-    st.markdown(f"**Sayfa {page+1} / 10 - Seviye: {p['level']}**")
-    text = current_story[page]
-    st.write(text)
+    # -------------------------
+    # AI ile hikaye görseli
+    # -------------------------
+    if story_text:
+        image_prompt = build_image_prompt(name, level, page_no, story_text)
 
-    # AI görsel prompt'u
-    prompt = build_image_prompt(p["name"], p["level"], page, text)
-    st.caption("🔮 AI image prompt (ileride gerçek görsel buradan üretilecek):")
-    st.code(prompt, language="text")
+        # DEBUG satirleri
+        st.write("DEBUG: image_prompt hazir")
 
-    # Seslendirme
-    if st.button("🔊 Dinle"):
-        tts = gTTS(text, lang='en', slow=True)
-        audio = io.BytesIO()
-        tts.write_to_fp(audio)
-        audio.seek(0)
-        st.audio(audio, format="audio/mp3")
+        img_bytes = generate_image_bytes(image_prompt)
 
-    # Mini quiz
-    page_quiz = quiz_data.get(p["level"], {}).get(page)
-    if page_quiz:
-        st.markdown("### ❓ Mini Quiz")
-        st.write(page_quiz["question"])
+        if img_bytes:
+            st.image(img_bytes, caption="AI illustration", use_container_width=True)
+        else:
+            st.write("DEBUG: img_bytes None")
 
-        selected = st.radio(
-            "Choose the correct answer:",
-            page_quiz["options"],
-            key=f"quiz_{p['level']}_{page}"
+    # -------------------------
+    # Mini Quiz
+    # -------------------------
+    if sentence is not None:
+        q = get_question(sentence["id"])
+    else:
+        q = None
+
+    if q:
+        st.markdown("### 🧠 Mini Quiz")
+        options = q["options"]
+        label_map = {"A": options[0], "B": options[1], "C": options[2]}
+
+        answer = st.radio(
+            q["text"],
+            options,
+            index=None,
+            key=f"quiz_{sentence['id']}_{page_no}",
         )
 
-        if st.button("Cevabı Kontrol Et", key=f"check_{p['level']}_{page}"):
-            if selected == page_quiz["answer"]:
-                st.success("✅ Correct! Great job!")
-                st.session_state.profile["progress"] = min(
-                    100, st.session_state.profile["progress"] + 5
-                )
-                st.session_state.profile["total_correct"] += 1
+        if answer:
+            chosen_letter = [k for k, v in label_map.items() if v == answer][0]
+            if chosen_letter == q["correct"]:
+                st.success("Great job! 🎉")
             else:
-                st.error("❌ Not correct. Try again.")
+                st.info("Tekrar deneyelim 🙂")
 
-    # Sayfa gezinme
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("⬅️ Önceki Sayfa"):
-            if st.session_state.profile["page"] > 0:
-                st.session_state.profile["page"] -= 1
-                st.rerun()
-    with col2:
-        if st.button("➡️ Sonraki Sayfa"):
-            st.session_state.profile["total_pages_read"] += 1
-            if st.session_state.profile["page"] < 9:
-                st.session_state.profile["page"] += 1
-            else:
-                st.session_state.profile["page"] = 0
-                st.session_state.profile["progress"] = min(
-                    100, st.session_state.profile["progress"] + 10
-                )
+    # -------------------------
+    # Seslendirme
+    # -------------------------
+    if story_text:
+        if st.button("🔊 Dinle"):
+            audio_bytes = tts_from_text(story_text, lang="en")
+            st.audio(audio_bytes, format="audio/mp3")
+
+    # -------------------------
+    # Görsel prompt (metin olarak)
+    # -------------------------
+    with st.expander("AI Görsel Prompt (demo)"):
+        image_prompt = build_image_prompt(name, level, page_no, story_text)
+        st.code(image_prompt, language="text")
+
+    # -------------------------
+    # Sayfa navigasyonu
+    # -------------------------
+    col_prev, col_next = st.columns(2)
+
+    with col_prev:
+        if st.button("⬅️ Önceki Sayfa", disabled=page_no <= 1):
+            st.session_state.page = max(1, page_no - 1)
             st.rerun()
 
-    st.progress(st.session_state.profile["progress"] / 100)
-    st.metric("🏆 Toplam İlerleme", f"{st.session_state.profile['progress']}%")
-
-    # Ebeveyn paneli
-    with st.expander("👨‍👩‍👧 Parent View / Ebeveyn Görünümü"):
-        total_pages = st.session_state.profile.get("total_pages_read", 0)
-        total_correct = st.session_state.profile.get("total_correct", 0)
-
-        st.write(f"Toplam okunan sayfa: **{total_pages}**")
-        st.write(f"Toplam doğru cevap: **{total_correct}**")
-
-        if total_correct >= 8 and p["level"] == "Başlangıç":
-            st.info("Öneri: Çocuğunuz bir üst seviye (Orta) için hazır olabilir.")
-        elif total_correct >= 8 and p["level"] == "Orta":
-            st.info("Öneri: Çocuğunuz bir üst seviye (İleri) için hazır olabilir.")
-        else:
-            st.write("Seviye: Şimdilik mevcut seviyede devam etmesi uygun görünüyor.")
-else:
-    st.info("Önce çocuğun adını ve seviyesini girip butona bas.")
-
+    with col_next:
+        if st.button("➡️ Sonraki Sayfa"):
+            st.session_state.page = page_no + 1
+            st.rerun()
