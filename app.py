@@ -10,22 +10,20 @@ import os
 # -----------------------------
 # Hugging Face istemcisi
 # -----------------------------
+HF_TOKEN = os.environ.get("HF_TOKEN")
+
 hf_client = InferenceClient(
-    provider="fal-ai",
-    api_key=os.environ.get("HF_TOKEN"),  # HF_TOKEN ortam değişkeni olmalı
+    # provider parametresini kaldırıyoruz
+    token=HF_TOKEN,
 )
 
 
 def generate_image(image_prompt: str):
-    """
-    Hugging Face üzerinden text-to-image görsel üretir.
-    PIL.Image döndürür; hata olursa None.
-    """
     try:
         st.write("DEBUG: image_prompt hazir")
         image = hf_client.text_to_image(
             image_prompt,
-            model="Tongyi-MAI/Z-Image-Turbo",  # istersek sonra değiştiririz
+            model="stabilityai/stable-diffusion-xl-base-1.0",  # SDXL, HF hosted
         )
         return image
     except Exception as e:
