@@ -2,39 +2,35 @@ import streamlit as st
 from gtts import gTTS
 import sqlite3
 import io
-from openai import OpenAI
-import base64
+import base64  # şu an kullanmıyoruz ama kalsın
+
+from huggingface_hub import InferenceClient
+import os
 
 # -----------------------------
-# OpenAI istemcisi ve görsel üretimi
+# Hugging Face istemcisi
 # -----------------------------
-def get_openai_client() -> OpenAI | None:
-    api_key = st.secrets.get("OPENAI_API_KEY", "")
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key)
+hf_client = InferenceClient(
+    provider="fal-ai",
+    api_key=os.environ.get("HF_TOKEN"),  # HF_TOKEN ortam değişkeni olmalı
+)
 
 
-@st.cache_data(show_spinner=True)
-def generate_image_bytes(prompt: str) -> bytes | None:
-    client = get_openai_client()
-    if client is None:
-        st.warning("OPENAI_API_KEY bulunamadı, demo modunda çalışıyor.")
-        return None
-
+def generate_image(image_prompt: str):
+    """
+    Hugging Face üzerinden text-to-image görsel üretir.
+    PIL.Image döndürür; hata olursa None.
+    """
     try:
-        result = client.images.generate(
-            model="gpt-image-1",
-            prompt=prompt,
-            size="1024x1024",
-            n=1,
+        st.write("DEBUG: image_prompt hazir")
+        image = hf_client.text_to_image(
+            image_prompt,
+            model="Tongyi-MAI/Z-Image-Turbo",  # istersek sonra değiştiririz
         )
-        image_base64 = result.data[0].b64_json
-        return base64.b64decode(image_base64)
+        return image
     except Exception as e:
         st.error(f"Görsel üretim hatası: {e}")
         return None
-
 
 
 # -----------------------------
@@ -148,7 +144,6 @@ st.set_page_config(page_title="Kids English Story", page_icon="🧒", layout="wi
 st.markdown("<h1 style='text-align: center;'>🧒 Kids English Story</h1>", unsafe_allow_html=True)
 st.write("Çocuğun adı ve seviyesini seç, sonra hikâyeyi başlat.")
 
-
 # Profil oluşturma / demo başlatma
 if "profile" not in st.session_state:
     with st.form("profile_form"):
@@ -194,15 +189,12 @@ else:
     if story_text:
         image_prompt = build_image_prompt(name, level, page_no, story_text)
 
-        # DEBUG satirleri
-        st.write("DEBUG: image_prompt hazir")
+        image = generate_image(image_prompt)
 
-        img_bytes = generate_image_bytes(image_prompt)
-
-        if img_bytes:
-            st.image(img_bytes, caption="AI illustration", use_container_width=True)
+        if image is not None:
+            st.image(image, caption="AI illustration", use_container_width=True)
         else:
-            st.write("DEBUG: img_bytes None")
+            st.write("DEBUG: image None")
 
     # -------------------------
     # Mini Quiz
